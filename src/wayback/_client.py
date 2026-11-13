@@ -39,6 +39,7 @@ from .exceptions import (
     UnexpectedResponseFormat,
     BlockedByRobotsError,
     BlockedSiteError,
+    CircularRedirectError,
     MementoPlaybackError,
     NoMementoError,
     WaybackRetryError,
@@ -1107,3 +1108,320 @@ class WaybackClient(_utils.DepthCountedContext):
                 break
 
         return memento
+
+    def get_memento_as_of(self, url, cutoff, max_lookback, *, follow_redirects=True):
+        """
+        Retrieve a memento of ``url`` representing only content available as of
+        a given UTC cutoff time. Unlike :meth:`get_memento`, this never returns
+        a capture made after the cutoff, even if the Wayback Machine tries to
+        redirect to one.
+
+        The process for each target URL is:
+
+        1. Query the CDX index for captures in the window between
+           ``cutoff - max_lookback`` and ``cutoff`` (inclusive). Because CDX
+           matches on a SURT-formatted URL that can differ from the requested
+           URL (e.g. ``http`` vs. ``https`` or ``www.`` vs. no subdomain),
+           results whose ``original`` URL does not exactly match the requested
+           URL are discarded.
+        2. Try the newest matching capture first, requesting it in
+           :attr:`Mode.original` playback.
+        3. If that capture cannot be played back, try the next-newest one, and
+           so on. Rate limiting, blocking, and network failures are always
+           raised rather than treated as a missing snapshot.
+        4. When a capture is a historical redirect (a memento with a 3xx
+           status) and ``follow_redirects`` is true, the redirect target is
+           resolved with the *same* cutoff and lookback window. Any redirect
+           from the archive itself is rejected if it points past the cutoff or
+           to a capture of a different URL.
+
+        Parameters
+        ----------
+        url : str
+            The URL to retrieve a memento of.
+        cutoff : datetime.datetime or datetime.date or str
+            The UTC cutoff time. No content captured after this time is ever
+            returned. Naive datetimes and Wayback-style timestamp strings are
+            interpreted as UTC.
+        max_lookback : int or datetime.timedelta
+            How far back from the cutoff to search for captures. If an int,
+            this is a number of seconds.
+        follow_redirects : boolean, default: True
+            If true (the default), historical redirects (3xx responses recorded
+            in the archive) are followed, with each redirect target resolved
+            against the same cutoff. If false, the memento of the redirect
+            response itself is returned.
+
+        Raises
+        ------
+        wayback.exceptions.NoMementoError
+            If there is no playable, exactly-matching capture in the window
+            (including when every candidate failed to play back).
+        wayback.exceptions.MementoPlaybackError
+            If a capture could not be played back for another reason, such as
+            a circular chain of historical redirects.
+        wayback.exceptions.RateLimitError
+            If the Wayback Machine responded with a 429 status. This is never
+            converted into a "no memento" result.
+        wayback.exceptions.BlockedSiteError
+        wayback.exceptions.BlockedByRobotsError
+            If the URL is blocked from access. These are never converted into
+            a "no memento" result.
+        wayback.exceptions.WaybackRetryError
+            If a network request failed after all retries. This is never
+            converted into a "no memento" result.
+
+        Returns
+        -------
+        Memento
+            A :class:`Memento` in :attr:`Mode.original` playback.
+        """
+        cutoff = _utils.ensure_utc_datetime(cutoff)
+        if isinstance(max_lookback, timedelta):
+            max_lookback = max_lookback.total_seconds()
+        elif not isinstance(max_lookback, (int, float)):
+            raise TypeError('`max_lookback` must be a number of seconds or a datetime.timedelta')
+        if max_lookback < 0:
+            raise ValueError('`max_lookback` must not be negative')
+
+        window_start = cutoff - timedelta(seconds=max_lookback)
+        history = []
+        debug_history = []
+        return self._resolve_as_of(
+            url,
+            cutoff=cutoff,
+            window_start=window_start,
+            follow_redirects=follow_redirects,
+            seen_urls=set(),
+            history=history,
+            debug_history=debug_history,
+        )
+
+    def _resolve_as_of(self, url, *, cutoff, window_start, follow_redirects, seen_urls, history, debug_history):
+        """
+        Resolve a single target URL within an as-of query, recursively
+        following historical redirects to their targets.
+
+        ``seen_urls`` is the authoritative set of live URLs already visited in
+        the current redirect chain; a URL already present means the chain is
+        circular. Entries are added around each historical-redirect hop and
+        rolled back when that hop fails, so trying an older fallback candidate
+        for the same URL is not mistaken for a cycle. ``history`` and
+        ``debug_history`` are shared across redirect targets; per-candidate
+        copies keep a failed candidate from polluting them.
+        """
+        if url in seen_urls:
+            raise CircularRedirectError(f'Historical redirects for {url} are circular')
+        seen_urls.add(url)
+
+        candidates = self._as_of_candidates(url, cutoff=cutoff, window_start=window_start)
+        failures = []
+        for record in candidates:
+            candidate_history = history.copy()
+            candidate_debug = debug_history.copy()
+            # Snapshot the chain so a failed redirect from this candidate can
+            # roll back any URLs it added before we try an older candidate.
+            chain_snapshot = seen_urls.copy()
+            try:
+                return self._play_as_of_candidate(
+                    record,
+                    cutoff=cutoff,
+                    window_start=window_start,
+                    follow_redirects=follow_redirects,
+                    seen_urls=seen_urls,
+                    history=candidate_history,
+                    debug_history=candidate_debug,
+                )
+            except CircularRedirectError:
+                # A circular historical-redirect chain is a structural
+                # problem, not a bad capture, so it is never retried or
+                # disguised as a missing snapshot.
+                raise
+            except (NoMementoError, MementoPlaybackError) as error:
+                # This capture (or a redirect from it) could not be resolved;
+                # restore the chain and fall back to the next-newest
+                # candidate. Network/rate-limit/blocking errors are not
+                # MementoPlaybackError subclasses and propagate untouched.
+                seen_urls.intersection_update(chain_snapshot)
+                failures.append(f'{record.timestamp:%Y%m%d%H%M%S}: {error}')
+
+        detail = f'; attempts: {"; ".join(failures)}' if failures else ''
+        raise NoMementoError(
+            f'No playable memento of {url} between {window_start:%Y-%m-%d %H:%M:%S} UTC '
+            f'and {cutoff:%Y-%m-%d %H:%M:%S} UTC{detail}'
+        )
+
+    def _as_of_candidates(self, url, *, cutoff, window_start):
+        """
+        Find CDX captures of exactly ``url`` within the as-of window and
+        return them newest-first.
+
+        CDX matching is based on SURT/canonicalized URLs, so the CDX response
+        can include records for URLs that merely resemble the requested one
+        (different scheme, ``www.`` prefix, case, etc.). Only records whose
+        ``original`` field is verbatim-equal to the requested URL (after the
+        same redundant-port normalization the CDX server applies) are kept.
+        Results are re-sorted here because CDX pagination does not guarantee
+        strict chronological ordering across pages.
+        """
+        # search() applies these same substitutions to CDX output, so apply
+        # them to the query too or exact comparisons could never match.
+        query_url = REDUNDANT_HTTPS_PORT.sub(r'\1\2', REDUNDANT_HTTP_PORT.sub(r'\1\2', url))
+
+        records = self.search(
+            query_url,
+            from_date=window_start,
+            to_date=cutoff,
+            # We perform our own exact-URL filtering below.
+            skip_malformed_results=False,
+        )
+        candidates = [
+            record
+            for record in records
+            if record.original == query_url and window_start <= record.timestamp <= cutoff
+        ]
+        return sorted(candidates, key=lambda record: record.timestamp, reverse=True)
+
+    def _play_as_of_candidate(
+        self, record, *, cutoff, window_start, follow_redirects, seen_urls, history, debug_history
+    ):
+        """
+        Request one CDX capture in original mode and validate every hop the
+        archive sends us through. Archive-internal redirects may only lead to
+        captures of the same URL at or before the cutoff; anything else is a
+        playback failure (and, in the caller, a reason to try an older
+        candidate). Historical (3xx memento) redirects are resolved against
+        the same cutoff and window.
+        """
+        mode = Mode.original.value
+        current_url = record.original
+        memento_url = _utils.format_memento_url(
+            url=current_url, timestamp=_utils.format_timestamp(record.timestamp), mode=mode
+        )
+        response = self.session.request('GET', memento_url, allow_redirects=False)
+        loop_guard = set()
+
+        while True:
+            if response.url in loop_guard:
+                read_and_close(response)
+                raise CircularRedirectError(f'Memento at {memento_url} is circular')
+            loop_guard.add(response.url)
+
+            captured_url, captured_date, current_mode = _utils.memento_url_data(response.url)
+            is_memento = is_memento_response(response)
+
+            # The `original` link names the URL the capture was actually taken
+            # from, which can differ from what we asked for due to SURT
+            # matching. Prefer it when present.
+            if response.links and 'original' in response.links:
+                captured_url = response.links['original']['url']
+
+            if not is_memento:
+                if response.next is None:
+                    self._raise_as_of_playback_error(response, memento_url)
+
+                target_url, target_date, _ = _utils.memento_url_data(response.next.url)
+                # The archive must not send us outside the as-of window
+                # (past the cutoff or earlier than the lookback allows) or
+                # swap the URL on us. Such a response means this capture is
+                # not playable within the as-of constraints.
+                if not (window_start <= target_date <= cutoff) or target_url != current_url:
+                    read_and_close(response)
+                    raise MementoPlaybackError(
+                        f'Memento at {memento_url} redirected outside the as-of window (to {response.next.url})'
+                    )
+
+                debug_history.append(response.url)
+                next_request = response.next
+                read_and_close(response)
+                response = self.session.send(next_request, allow_redirects=False)
+                continue
+
+            # A real memento. Guard against an archive-side hop that silently
+            # changed the timestamp or URL even though it set memento headers.
+            if not (window_start <= captured_date <= cutoff) or captured_url != current_url:
+                read_and_close(response)
+                raise MementoPlaybackError(
+                    f'Memento at {memento_url} does not match the requested as-of capture (got {response.url})'
+                )
+
+            links = clean_memento_links(response.links, mode)
+            memento = Memento(
+                url=captured_url,
+                timestamp=captured_date,
+                mode=current_mode,
+                memento_url=response.url,
+                status_code=response.status_code,
+                headers=Memento.parse_memento_headers(response.headers, response.url),
+                encoding=response.encoding,
+                raw=response,
+                raw_headers=response.headers,
+                links=links,
+                history=history,
+                debug_history=debug_history,
+            )
+
+            if not follow_redirects or not memento.is_redirect:
+                return memento
+
+            # A historical redirect captured in the memento itself. The
+            # target URL is resolved with the same cutoff and window.
+            target_live_url = memento.headers.get('Location')
+            if not target_live_url:
+                raise MementoPlaybackError(f'Memento at {memento_url} is a redirect but has no Location header')
+
+            history.append(memento)
+            debug_history.append(response.url)
+            # Cache the body and release the connection before requesting the
+            # redirect target, mirroring get_memento(). The Memento object in
+            # `history` retains the cached content and parsed headers.
+            read_and_close(response)
+
+            try:
+                return self._resolve_as_of(
+                    target_live_url,
+                    cutoff=cutoff,
+                    window_start=window_start,
+                    follow_redirects=follow_redirects,
+                    seen_urls=seen_urls,
+                    history=history,
+                    debug_history=debug_history,
+                )
+            except CircularRedirectError:
+                # A loop is structural; do not roll back or retry.
+                raise
+            except (NoMementoError, MementoPlaybackError):
+                # The target could not be resolved for this candidate. Roll
+                # back the redirect bookkeeping; the caller (_resolve_as_of)
+                # restores `seen_urls` from its snapshot before trying an
+                # older fallback candidate.
+                history.pop()
+                debug_history.pop()
+                raise
+
+    @staticmethod
+    def _raise_as_of_playback_error(response, url):
+        """
+        Translate a non-memento terminal response from the archive into the
+        appropriate exception. Mirrors the error classification used by
+        :meth:`get_memento`.
+        """
+        message = response.headers.get('X-Archive-Wayback-Runtime-Error', '')
+        if ('AdministrativeAccessControlException' in message) or ('URL has been excluded' in response.text):
+            read_and_close(response)
+            raise BlockedSiteError(f'{url} is blocked from access')
+        elif ('RobotAccessControlException' in message) or ('robots.txt' in response.text):
+            read_and_close(response)
+            raise BlockedByRobotsError(f'{url} is blocked by robots.txt')
+        elif message:
+            read_and_close(response)
+            raise MementoPlaybackError(f'Memento at {url} could not be played: {message}')
+        elif response.status_code == 404:
+            read_and_close(response)
+            raise NoMementoError(f'The URL {url} has no mementos and was never archived')
+        elif not response.ok:
+            read_and_close(response)
+            raise MementoPlaybackError(f'{response.status_code} error while loading memento at {url}')
+        else:
+            read_and_close(response)
+            raise MementoPlaybackError(f'Memento at {url} could not be played')

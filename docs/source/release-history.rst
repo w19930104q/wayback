@@ -5,6 +5,10 @@ Release History
 In Development
 --------------
 
+- Added :meth:`wayback.WaybackClient.get_memento_as_of`, an entry point for collecting a memento that contains only content available as of a given UTC cutoff time. It selects the newest playable, exactly-URL-matching CDX capture within a cutoff/lookback window, never follows archive redirects past the cutoff or to a different URL, resolves historical redirect targets against the same cutoff, propagates rate-limit/blocking/network errors instead of reporting a missing snapshot, and fails explicitly on circular redirects or empty windows. The existing ``search()``, ``get_memento()`` behavior, and memento ``history`` semantics are unchanged.
+
+- Added :class:`wayback.exceptions.CircularRedirectError`, raised when following historical redirects in :meth:`wayback.WaybackClient.get_memento_as_of` forms a loop.
+
 - Added a “funding” link to the project’s PyPI listing. You can donate to EDGI’s work (including this project) at https://envirodatagov.org/donate/. (:issue:`222`)
 
 

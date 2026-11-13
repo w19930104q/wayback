@@ -116,6 +116,47 @@ We picked up a couple additional occurrences that the original count missed.
    __cassette.__exit__()
 
 
+Collecting a page "as of" a point in time
+=========================================
+
+Sometimes you need the version of a page that would have been available at a
+specific moment, and you need a guarantee that nothing captured *after* that
+moment is mixed in. :meth:`WaybackClient.get_memento_as_of` provides this. It
+takes the original URL, a UTC cutoff time, and a maximum lookback, and returns
+a memento in :attr:`wayback.Mode.original` playback:
+
+.. code-block:: python
+
+   from datetime import datetime, timedelta, timezone
+
+   cutoff = datetime(2020, 7, 2, tzinfo=timezone.utc)
+   memento = client.get_memento_as_of(
+       'https://example.gov/page',
+       cutoff=cutoff,
+       max_lookback=timedelta(days=30),
+   )
+
+For each URL it resolves, it:
+
+1. Queries the CDX index for captures between ``cutoff - max_lookback`` and
+   ``cutoff`` (inclusive). Because CDX matches on SURT/canonicalized URLs,
+   rows whose ``original`` URL does not match the requested URL *verbatim*
+   (e.g. an ``http`` vs. ``https`` or ``www.`` difference) are discarded.
+2. Picks the newest matching, playable capture. If a newer candidate cannot be
+   played back, it falls back to the next-newest one.
+3. Rejects any archive redirect that would cross the cutoff or hand back a
+   capture of a different URL. Rate limiting (429), blocking, and network
+   failures are always raised -- never silently reported as "no snapshot".
+4. If the capture is itself a historical redirect (a 3xx memento), its target
+   is resolved against the *same* cutoff and lookback window. Pass
+   ``follow_redirects=False`` to get the redirect response itself instead.
+
+Circular historical redirects and windows with no playable, exactly-matching
+capture fail explicitly with
+:class:`wayback.exceptions.CircularRedirectError` and
+:class:`wayback.exceptions.NoMementoError`, respectively.
+
+
 API Documentation
 =================
 
@@ -127,6 +168,7 @@ Memento API. We implement a Python client that can speak both.
 
     .. automethod:: search
     .. automethod:: get_memento
+    .. automethod:: get_memento_as_of
 
 .. autoclass:: wayback.CdxRecord
 
@@ -162,6 +204,8 @@ Exception Classes
 .. autoclass:: wayback.exceptions.MementoPlaybackError
 
 .. autoclass:: wayback.exceptions.NoMementoError
+
+.. autoclass:: wayback.exceptions.CircularRedirectError
 
 .. autoclass:: wayback.exceptions.RateLimitError
 

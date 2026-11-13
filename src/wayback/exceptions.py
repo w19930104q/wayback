@@ -52,6 +52,13 @@ class NoMementoError(MementoPlaybackError):
     """
 
 
+class CircularRedirectError(MementoPlaybackError):
+    """
+    Raised when following historical redirects leads back to a URL that was
+    already part of the redirect chain (i.e. the redirects form a loop).
+    """
+
+
 class WaybackRetryError(WaybackException):
     """
     Raised when a request to the Wayback Machine has been retried and failed

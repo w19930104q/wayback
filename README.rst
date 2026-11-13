@@ -49,6 +49,18 @@ Finally, search for all the mementos of ``nasa.gov`` before 1999 and download th
     for record in client.search('http://nasa.gov', to_date=date(1999, 1, 1)):
         memento = client.get_memento(record)
 
+To collect a page strictly "as of" a UTC cutoff time (never mixing in captures made after it, and with CDX results matched to the URL verbatim rather than by SURT similarity), use ``get_memento_as_of``:
+
+.. code-block:: python
+
+    from datetime import datetime, timedelta, timezone
+
+    memento = client.get_memento_as_of(
+        'http://nasa.gov',
+        cutoff=datetime(1999, 1, 1, tzinfo=timezone.utc),
+        max_lookback=timedelta(days=30),
+    )
+
 Read the `full documentation <https://wayback.readthedocs.io/>`_ for a more in-depth tutorial and complete API reference documentation at https://wayback.readthedocs.io/
 
 
