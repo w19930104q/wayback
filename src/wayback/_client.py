@@ -28,7 +28,7 @@ from requests.exceptions import (
     Timeout,
 )
 import time
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urldefrag, urljoin, urlparse
 from urllib3.connectionpool import HTTPConnectionPool
 from urllib3.exceptions import ConnectTimeoutError, MaxRetryError, ReadTimeoutError
 from warnings import warn
@@ -212,6 +212,55 @@ def clean_memento_links(links, mode):
             result[key] = value
 
     return result
+
+
+def _strip_fragment(url):
+    """Return ``url`` with any fragment (the part after ``#``) removed."""
+    return urldefrag(url)[0]
+
+
+def _same_target_url(first, second):
+    """
+    Determine whether two captured URLs identify the exact same target,
+    ignoring any URL fragments (e.g. ``#section``).
+
+    Unlike a SURT-based comparison, this is a verbatim string comparison, so
+    different pages that share a SURT (different hosts, schemes, paths, query
+    strings, etc.) are never treated as equal.
+    """
+    return _strip_fragment(first) == _strip_fragment(second)
+
+
+def _detect_view_mode_redirect(response, current_date):
+    """
+    Wrapper around :func:`detect_view_mode_redirect` that first checks whether
+    the response was actually requested in view mode. Returns the redirect URL
+    or ``None``.
+    """
+    if _utils.memento_url_data(response.url)[2] != Mode.view.value:
+        return None
+    return detect_view_mode_redirect(response, current_date)
+
+
+def _raise_playback_error(response, url):
+    """
+    Inspect a response that could not be played back as a memento and raise the
+    appropriate exception. The response should already have been read and
+    closed before calling this.
+    """
+    message = response.headers.get('X-Archive-Wayback-Runtime-Error', '')
+    if ('AdministrativeAccessControlException' in message) or ('URL has been excluded' in response.text):
+        raise BlockedSiteError(f'{url} is blocked from access')
+    elif ('RobotAccessControlException' in message) or ('robots.txt' in response.text):
+        raise BlockedByRobotsError(f'{url} is blocked by robots.txt')
+    elif message:
+        raise MementoPlaybackError(f'Memento at {url} could not be played: {message}')
+    elif response.ok:
+        raise MementoPlaybackError(f'Memento at {url} could not be played')
+    elif response.status_code == 404:
+        raise NoMementoError(f'The URL {url} has no mementos and was never archived')
+    else:
+        raise MementoPlaybackError(f'{response.status_code} error while loading memento at {url}')
 
 
 #####################################################################
@@ -828,6 +877,7 @@ class WaybackClient(_utils.DepthCountedContext):
         exact_redirects=None,
         target_window=timedelta(hours=24),
         follow_redirects=True,
+        strict_targets=False,
         # Deprecated Parameters
         datetime=None,
     ):
@@ -894,6 +944,21 @@ class WaybackClient(_utils.DepthCountedContext):
             ``http://example.com/b``, then this method returns the memento for
             ``/a`` when ``follow_redirects=False`` and the memento for ``/b``
             when ``follow_redirects=True``.
+        strict_targets : boolean, default: False
+            If true, require that following a historical redirect only ever
+            plays back a capture of the redirect's verbatim target URL
+            (ignoring fragments) and within ``target_window`` of the redirect's
+            capture time. When a historical redirect is encountered, this
+            searches the CDX index for captures of the exact target URL and
+            plays back the earliest one that is both within the window and
+            actually playable, instead of relying on the Wayback Machine's
+            SURT-based redirect, which can conflate different pages that share
+            a SURT-formatted URL. Unplayable candidates are skipped, but blocked
+            URLs and network errors raise an exception, and a missing candidate
+            is an explicit failure. This always requires exact URL matches
+            regardless of the ``exact`` and ``exact_redirects`` parameters. It
+            has no effect when ``follow_redirects=False`` and does not change
+            any behavior when false (the default).
 
         Returns
         -------
@@ -945,6 +1010,14 @@ class WaybackClient(_utils.DepthCountedContext):
 
         original_date_wayback = _utils.format_timestamp(original_date)
         url = _utils.format_memento_url(url=original_url, timestamp=original_date_wayback, mode=mode)
+
+        if strict_targets and follow_redirects:
+            return self._get_memento_strict(
+                url=url,
+                mode=mode,
+                target_window=target_window,
+                original_date=original_date,
+            )
 
         # Correctly following redirects is actually pretty complicated. In
         # the simplest case, a memento is a simple web page, and that's
@@ -1061,32 +1134,7 @@ class WaybackClient(_utils.DepthCountedContext):
 
                 if not playable:
                     read_and_close(response)
-                    message = response.headers.get('X-Archive-Wayback-Runtime-Error', '')
-                    if (
-                        ('AdministrativeAccessControlException' in message)
-                        or ('URL has been excluded' in response.text)
-                    ):  # fmt: skip
-                        raise BlockedSiteError(f'{url} is blocked from access')
-                    elif (
-                        ('RobotAccessControlException' in message)
-                        or ('robots.txt' in response.text)
-                    ):  # fmt: skip
-                        raise BlockedByRobotsError(f'{url} is blocked by robots.txt')
-                    elif message:
-                        raise MementoPlaybackError(f'Memento at {url} could not be played: {message}')
-                    elif response.ok:
-                        # TODO: Raise more specific errors for the possible
-                        # cases here. We *should* only arrive here when
-                        # there's a redirect and:
-                        # - `exact` is true.
-                        # - `exact_redirects` is true and the redirect was
-                        #   not exact.
-                        # - The target URL is outside `target_window`.
-                        raise MementoPlaybackError(f'Memento at {url} could not be played')
-                    elif response.status_code == 404:
-                        raise NoMementoError(f'The URL {url} has no mementos and was never archived')
-                    else:
-                        raise MementoPlaybackError(f'{response.status_code} error while loading memento at {url}')
+                    _raise_playback_error(response, url)
 
             if response.next:
                 previous_was_memento = is_memento
@@ -1107,3 +1155,227 @@ class WaybackClient(_utils.DepthCountedContext):
                 break
 
         return memento
+
+    def _apply_view_mode_redirect(self, response, current_date):
+        """
+        Detect a historical redirect served in view mode and, if present,
+        mutate the response to behave like a redirect served in another mode
+        (setting ``response.next`` and the ``Memento-Datetime`` header).
+        """
+        redirect_url = _detect_view_mode_redirect(response, current_date)
+        if redirect_url:
+            redirect = requests.Request('GET', redirect_url)
+            response._next = self.session.prepare_request(redirect)
+            response.headers['Memento-Datetime'] = current_date.strftime('%a, %d %b %Y %H:%M:%S %Z')
+
+    def _build_memento(self, response, *, current_url, mode, history, debug_history):
+        """Construct a :class:`Memento` from a playback ``response``."""
+        current_date = _utils.memento_url_data(response.url)[1]
+        return Memento(
+            url=current_url,
+            timestamp=current_date,
+            mode=_utils.memento_url_data(response.url)[2],
+            memento_url=response.url,
+            status_code=response.status_code,
+            headers=Memento.parse_memento_headers(response.headers, response.url),
+            encoding=response.encoding,
+            raw=response,
+            raw_headers=response.headers,
+            links=clean_memento_links(response.links, mode),
+            history=history,
+            debug_history=debug_history,
+        )
+
+    def _get_memento_strict(self, *, url, mode, target_window, original_date):
+        """
+        Implementation of :meth:`get_memento` when ``strict_targets=True``.
+
+        Historical redirects are resolved through the CDX index instead of
+        trusting the Wayback Machine's SURT-based redirects, so playback can
+        never drift to a different URL or outside ``target_window``.
+        """
+        history = []
+        debug_history = []
+
+        # Every historical redirect target we have processed, so a chain that
+        # loops back to a URL it already visited terminates with an error.
+        # Targets use the same redundant-port normalization as CDX's `original`
+        # field and are compared without fragments.
+        def _redirect_key(redirect_url):
+            return REDUNDANT_HTTPS_PORT.sub(
+                r'\1\2', REDUNDANT_HTTP_PORT.sub(r'\1\2', _strip_fragment(redirect_url))
+            )
+
+        redirect_targets = {_redirect_key(_utils.memento_url_data(url)[0])}
+        # For the first response, the window is measured from the requested
+        # time. Each accepted historical hop re-bases it on its own capture.
+        window_start = original_date
+        requested_url = _utils.memento_url_data(url)[0]
+
+        response = self.session.request('GET', url, allow_redirects=False)
+        while True:
+            current_url, current_date, _ = _utils.memento_url_data(response.url)
+            self._apply_view_mode_redirect(response, current_date)
+            is_memento = is_memento_response(response)
+
+            # A memento URL will match possible captures based on its SURT
+            # form, which means we might be getting back a memento captured
+            # from a different URL than the one specified in the request.
+            # If present, the `original` link will be the *captured* URL.
+            if response.links and ('original' in response.links):
+                current_url = response.links['original']['url']
+
+            if is_memento:
+                memento = self._build_memento(
+                    response,
+                    current_url=current_url,
+                    mode=mode,
+                    history=history,
+                    debug_history=debug_history,
+                )
+
+                if not response.next:
+                    # A final, non-redirecting memento.
+                    break
+
+                # This memento is itself a historical redirect. Resolve its
+                # verbatim target through the CDX index instead of following
+                # Wayback's SURT-based redirect.
+                target_url = memento.headers.get('location')
+                if not target_url:
+                    target_url = _utils.memento_url_data(response.next.url)[0]
+                target_url = _strip_fragment(target_url)
+                if _redirect_key(target_url) in redirect_targets:
+                    read_and_close(response)
+                    raise MementoPlaybackError(f'Memento at {url} is circular')
+                redirect_targets.add(_redirect_key(target_url))
+
+                debug_history.append(response.url)
+                history.append(memento)
+                read_and_close(response)
+                response = self._strict_candidate_memento(
+                    target_url=target_url,
+                    redirect_date=current_date,
+                    mode=mode,
+                    target_window=target_window,
+                    debug_history=debug_history,
+                )
+                # The next hop's window runs from this redirect's capture.
+                window_start = current_date
+            else:
+                playable = False
+                next_request = response.next
+                if next_request and len(history) == 0:
+                    # On the very first request, a non-memento response (e.g.
+                    # no capture at the requested timestamp) may redirect to
+                    # the closest-in-time capture. Only follow it when that
+                    # capture is of the exact same URL and inside the window.
+                    fallback_url, fallback_date, _ = _utils.memento_url_data(next_request.url)
+                    if (
+                        _same_target_url(fallback_url, requested_url)
+                        and abs(fallback_date - window_start).total_seconds() <= target_window
+                    ):
+                        playable = True
+
+                previous_url = response.url
+                read_and_close(response)
+                if not playable:
+                    _raise_playback_error(response, url)
+
+                debug_history.append(previous_url)
+                response = self.session.send(next_request, allow_redirects=False)
+
+        return memento
+
+    def _strict_candidate_memento(self, *, target_url, redirect_date, mode, target_window, debug_history):
+        """
+        Find and play back the earliest playable capture of the exact
+        ``target_url`` (ignoring fragments) captured at or after
+        ``redirect_date`` and within ``target_window`` of it.
+
+        CDX results are fully paged, deduplicated, and sorted here, so the
+        pagination, ordering, or repetition of CDX rows cannot affect which
+        capture is selected. Unplayable candidates are skipped; blocked URLs
+        and network errors propagate.
+        """
+        # CDX's `original` field normalizes away redundant default ports; do
+        # the same before any verbatim comparison.
+        normalized_target = REDUNDANT_HTTPS_PORT.sub(r'\1\2', REDUNDANT_HTTP_PORT.sub(r'\1\2', target_url))
+
+        # Exhaust the potentially multi-page CDX search up front. Blocked URL
+        # errors and network errors propagate from the iterator.
+        records = list(
+            self.search(
+                target_url,
+                from_date=redirect_date,
+                to_date=redirect_date + timedelta(seconds=target_window),
+            )
+        )
+        # Pages can repeat rows; CdxRecord compares on all fields, so this
+        # removes exact duplicates regardless of page or row order.
+        records = list(set(records))
+
+        # Keep captures of the verbatim target URL (fragments ignored) that
+        # are still within the window, then always try the earliest first no
+        # matter what order CDX returned them in.
+        candidates = sorted(
+            (
+                record
+                for record in records
+                if _same_target_url(record.original, normalized_target)
+                and 0 <= (record.timestamp - redirect_date).total_seconds() <= target_window
+            ),
+            key=lambda record: (record.timestamp, record.original),
+        )
+
+        if not candidates:
+            raise NoMementoError(
+                f'No playable memento of {target_url} within {target_window} seconds of '
+                f'{redirect_date.isoformat()}'
+            )
+
+        last_error = None
+        for record in candidates:
+            candidate_url = _utils.format_memento_url(
+                url=record.original,
+                timestamp=_utils.format_timestamp(record.timestamp),
+                mode=mode,
+            )
+            response = self.session.request('GET', candidate_url, allow_redirects=False)
+            current_url, current_date, _ = _utils.memento_url_data(response.url)
+            self._apply_view_mode_redirect(response, current_date)
+
+            if not is_memento_response(response):
+                # Not playable (e.g. a Wayback runtime error page). Record the
+                # attempt, then close it and move on -- unless it is a block,
+                # which must propagate.
+                debug_history.append(response.url)
+                read_and_close(response)
+                try:
+                    _raise_playback_error(response, candidate_url)
+                except (BlockedSiteError, BlockedByRobotsError):
+                    raise
+                except MementoPlaybackError as error:
+                    last_error = error
+                    continue
+
+            if response.links and ('original' in response.links):
+                current_url = response.links['original']['url']
+
+            # Reject playback that drifted to another URL or outside the
+            # window, even if Wayback served it as a memento.
+            if not _same_target_url(current_url, normalized_target) or not (
+                0 <= (current_date - redirect_date).total_seconds() <= target_window
+            ):
+                debug_history.append(response.url)
+                read_and_close(response)
+                last_error = MementoPlaybackError(
+                    f'Memento at {candidate_url} drifted to {current_url} at {current_date.isoformat()}'
+                )
+                continue
+
+            return response
+
+        raise MementoPlaybackError(
+            f'No playable memento of {target_url} within {target_window} seconds of {redirect_date.isoformat()}'
+        ) from last_error

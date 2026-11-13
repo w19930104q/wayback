@@ -7,6 +7,8 @@ In Development
 
 - Added a “funding” link to the project’s PyPI listing. You can donate to EDGI’s work (including this project) at https://envirodatagov.org/donate/. (:issue:`222`)
 
+- Added an opt-in strict target mode for :meth:`wayback.WaybackClient.get_memento` through a new ``strict_targets`` parameter (off by default). When following a historical redirect, it uses the CDX index to play back the earliest playable capture of the redirect’s exact target URL (ignoring fragments) within ``target_window``, instead of trusting the Wayback Machine’s SURT-based redirects, which can conflate different pages that share a SURT. Pagination, ordering, and duplicate CDX rows do not affect the selection; unplayable candidates are skipped, but blocked URLs and network errors still raise, and a missing candidate fails explicitly. The default behavior, other playback modes, and ``follow_redirects=False`` are unchanged.
+
 
 v0.5.1 (2026-06-19)
 -------------------
